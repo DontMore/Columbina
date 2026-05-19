@@ -54,6 +54,12 @@ Both applications are styled using our premium **Modern Slate Theme**, featuring
 
 Kedua aplikasi menggunakan **Modern Slate Theme** yang sangat elegan, dengan latar belakang slate, highlight indigo yang cerah, dan tipografi kustom yang mendukung Mode Gelap (Dark Mode) maupun Mode Terang (Light Mode).
 
+### DocUploader Server & Dashboard
+![DocUploader Dashboard](Screenshot/DocUploader.png)
+
+### FileWatcher Client
+![FileWatcher Client](Screenshot/FileWatcher.png)
+
 ---
 
 ## 🛠️ Build & Installation / Kompilasi & Instalasi

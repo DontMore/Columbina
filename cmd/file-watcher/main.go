@@ -41,18 +41,22 @@ type WatchPath struct {
 }
 
 var (
-	watcher        *fsnotify.Watcher
-	watcherLock    sync.Mutex
-	isWatching     bool
-	watcherLog     *widget.Entry
-	db             *sql.DB
-	myWindow       fyne.Window
-	watchPaths     []WatchPath
-	pathsTable     *widget.Table
+	watcher         *fsnotify.Watcher
+	watcherLock     sync.Mutex
+	isWatching      bool
+	watcherLog      *widget.Entry
+	db              *sql.DB
+	myWindow        fyne.Window
+	watchPaths      []WatchPath
+	pathsTable      *widget.Table
 	selectedPathRow = -1
 
 	// Maps files currently in-flight to prevent duplicate uploads
 	uploadingFiles sync.Map
+
+	// Log Toggle Settings
+	logEnabled   bool
+	logEnabledMu sync.RWMutex
 )
 
 func initDB() {
@@ -64,17 +68,10 @@ func initDB() {
 		return
 	}
 	_, err = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watch_paths (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		folder_path TEXT UNIQUE,
-		api_url TEXT,
-		enabled INTEGER DEFAULT 1,
-		bearer_token TEXT
-	)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watch_paths ( id INTEGER PRIMARY KEY AUTOINCREMENT, folder_path TEXT UNIQUE, api_url TEXT, enabled INTEGER DEFAULT 1, bearer_token TEXT )`)
 	if err != nil {
 		fmt.Printf("Error creating tables: %v\n", err)
 	}
-
 	// Persist/Generate persistent WATCHER-XXXXX UUID if not exists
 	uuid := loadSetting("watcher_uuid", "")
 	if uuid == "" {
@@ -131,11 +128,23 @@ func loadWatchPaths() {
 }
 
 func addWatcherLog(msg string) {
+	// Cek apakah logging diaktifkan (thread-safe)
+	logEnabledMu.RLock()
+	enabled := logEnabled
+	logEnabledMu.RUnlock()
+
+	if !enabled {
+		return // Lewati update UI jika logging dimatikan
+	}
+
 	timestamp := time.Now().Format("15:04:05")
 	if watcherLog != nil {
-		watcherLog.SetText(watcherLog.Text + fmt.Sprintf("[%s] %s\n", timestamp, msg))
-		watcherLog.CursorColumn = 0
-		watcherLog.CursorRow = len(watcherLog.Text)
+		// Update UI dengan aman dari goroutine mana pun untuk mencegah race condition/panic pada Fyne
+		fyne.CurrentApp().Driver().DoFromGoroutine(func() {
+			watcherLog.SetText(watcherLog.Text + fmt.Sprintf("[%s] %s\n", timestamp, msg))
+			watcherLog.CursorColumn = 0
+			watcherLog.CursorRow = len(watcherLog.Text)
+		}, false)
 	}
 }
 
@@ -147,7 +156,6 @@ func refreshPathsTable() {
 func showAddPathDialog(parent fyne.Window, onSave func()) {
 	folderEntry := widget.NewEntry()
 	folderEntry.SetPlaceHolder("Local folder path to monitor")
-
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("e.g. http://localhost:8080/upload/pebjf")
 
@@ -197,7 +205,6 @@ func showAddPathDialog(parent fyne.Window, onSave func()) {
 func showEditPathDialog(parent fyne.Window, wp WatchPath, onSave func()) {
 	folderEntry := widget.NewEntry()
 	folderEntry.SetText(wp.FolderPath)
-
 	urlEntry := widget.NewEntry()
 	urlEntry.SetText(wp.ApiUrl)
 
@@ -273,7 +280,6 @@ func uploadFile(filePath string, apiUrl string, token string) error {
 		return err
 	}
 	defer file.Close()
-
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
@@ -334,7 +340,6 @@ func processFileUpload(filePath string, apiUrl string, token string) {
 		return
 	}
 	defer uploadingFiles.Delete(filePath)
-
 	if !waitFileStable(filePath) {
 		return
 	}
@@ -361,7 +366,6 @@ func registerWatcher() {
 	if serverBase == "" {
 		return
 	}
-
 	type PathPayload struct {
 		Folder   string `json:"folder"`
 		Endpoint string `json:"endpoint"`
@@ -436,7 +440,6 @@ func startHeartbeatLoop() {
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-
 			watcherLock.Lock()
 			watching := isWatching
 			watcherLock.Unlock()
@@ -478,7 +481,6 @@ func startRetryLoop() {
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-
 			watcherLock.Lock()
 			watching := isWatching
 			watcherLock.Unlock()
@@ -518,6 +520,10 @@ func startRetryLoop() {
 
 func main() {
 	initDB()
+
+	// Muat pengaturan toggle log (default: true/aktif)
+	logEnabled = loadSetting("enable_log", "true") == "true"
+
 	loadWatchPaths()
 	startHeartbeatLoop()
 	startRetryLoop()
@@ -657,6 +663,31 @@ func main() {
 
 	statusLabel := widget.NewLabel("🔴 Watcher Stopped")
 
+	// --- TOMBOL TOGGLE LOG & CLEAR ---
+	enableLogCheck := widget.NewCheck("Enable Activity Logs", func(checked bool) {
+		logEnabledMu.Lock()
+		logEnabled = checked
+		logEnabledMu.Unlock()
+		saveSetting("enable_log", fmt.Sprintf("%t", checked))
+
+		if checked {
+			addWatcherLog("Activity logging has been enabled.")
+		}
+	})
+	enableLogCheck.SetChecked(logEnabled)
+
+	clearLogBtn := widget.NewButton("Clear", func() {
+		if watcherLog != nil {
+			watcherLog.SetText("")
+		}
+	})
+
+	logHeader := container.NewHBox(
+		widget.NewLabel("Activity Logs:"),
+		enableLogCheck,
+		clearLogBtn,
+	)
+
 	// Watch Start/Stop Logic
 	var startStopBtn *widget.Button
 	startStopBtn = widget.NewButton("Start Watching", func() {
@@ -717,6 +748,7 @@ func main() {
 			for _, wp := range activePaths {
 				err = watcher.Add(wp.FolderPath)
 				if err != nil {
+					// PERBAIKAN: Menggunakan wp.FolderPath, bukan wp.FAdapterPath
 					addWatcherLog(fmt.Sprintf("Error adding folder %s: %v", wp.FolderPath, err))
 				} else {
 					addWatcherLog(fmt.Sprintf("Monitoring: %s", wp.FolderPath))
@@ -805,7 +837,7 @@ func main() {
 		container.NewVBox(
 			startStopBtn,
 			statusLabel,
-			widget.NewLabel("Activity Logs:"),
+			logHeader, // <-- TOMBOL TOGGLE LOG ADA DI SINI
 			scrollLogs,
 		),
 		nil, nil,

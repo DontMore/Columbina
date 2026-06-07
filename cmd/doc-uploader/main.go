@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -62,12 +63,12 @@ type LogEntry struct {
 }
 
 var (
-	server         *http.Server
-	serverLock     sync.Mutex
-	isRunning      bool
-	logEntry       *widget.Entry
-	db             *sql.DB
-	myWindow       fyne.Window
+	server     *http.Server
+	serverLock sync.Mutex
+	isRunning  bool
+	logEntry   *widget.Entry
+	db         *sql.DB
+	myWindow   fyne.Window
 
 	// Data stores
 	endpoints    []Endpoint
@@ -84,7 +85,46 @@ var (
 	// Watcher detail UI elements
 	watcherDetailsLabel *widget.Label
 	watcherPathsList    *widget.Entry
+
+	// Mutex to protect concurrent logging to log file and dedupe throttling
+	logMutex sync.Mutex
+
+	// Throttled UI logging to prevent Fyne Entry panics
+	logCh          chan string
+	logChOnce      sync.Once
+	logUIStopCh    chan struct{}
+	logUIUpdaterOn bool
+
+	// Log Toggle Settings
+	logSettingsMux  sync.RWMutex
+	enableSystemLog bool
+	enableUploadLog bool
 )
+
+// Helper to write logs to logerror.txt
+func writeToErrorLog(level string, message string) {
+	_ = os.MkdirAll("data", 0755)
+	f, err := os.OpenFile("logerror.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("Failed to open logerror.txt: %v\n", err)
+		return
+	}
+	defer f.Close()
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, _ = f.WriteString(fmt.Sprintf("[%s] [%s] %s\n", timestamp, level, message))
+}
+
+// Global panic recovery helper to catch goroutine crashes
+func handlePanic(goroutineName string) {
+	if r := recover(); r != nil {
+		stackTrace := string(debug.Stack())
+		errStr := fmt.Sprintf("CRASH PANIC in goroutine [%s]: %v\nStack Trace:\n%s\n----------------------------------------\n", goroutineName, r, stackTrace)
+		fmt.Fprint(os.Stderr, errStr)
+		writeToErrorLog("CRASH", errStr)
+		// Attempt safe UI notification
+		addLog(fmt.Sprintf("CRITICAL CRASH detected in %s! Details written to logerror.txt", goroutineName))
+	}
+}
 
 func initDB() {
 	_ = os.MkdirAll("data", 0755)
@@ -92,13 +132,14 @@ func initDB() {
 	db, err = sql.Open("sqlite3", "./data/uploader_settings.db")
 	if err != nil {
 		fmt.Printf("Error opening DB: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error opening DB: %v", err))
 		return
 	}
 
 	// Settings Table
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT) ")
 	if err != nil {
-		fmt.Printf("Error creating settings table: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating settings table: %v", err))
 	}
 
 	// Upload Endpoints Table
@@ -113,7 +154,7 @@ func initDB() {
 		auth_token TEXT
 	)`)
 	if err != nil {
-		fmt.Printf("Error creating upload_endpoints table: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating upload_endpoints table: %v", err))
 	}
 
 	// Watchers Table
@@ -126,7 +167,7 @@ func initDB() {
 		status TEXT
 	)`)
 	if err != nil {
-		fmt.Printf("Error creating watchers table: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating watchers table: %v", err))
 	}
 
 	// Watcher Paths Table
@@ -138,7 +179,7 @@ func initDB() {
 		UNIQUE(watcher_uuid, folder_path, endpoint)
 	)`)
 	if err != nil {
-		fmt.Printf("Error creating watcher_paths table: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating watcher_paths table: %v", err))
 	}
 
 	// Upload Logs Table
@@ -151,7 +192,7 @@ func initDB() {
 		uploaded_at DATETIME
 	)`)
 	if err != nil {
-		fmt.Printf("Error creating upload_logs table: %v\n", err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating upload_logs table: %v", err))
 	}
 }
 
@@ -159,6 +200,7 @@ func saveSetting(key, value string) {
 	_, err := db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value)
 	if err != nil {
 		fmt.Printf("Error saving setting %s: %v\n", key, err)
+		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error saving setting %s: %v", key, err))
 	}
 }
 
@@ -171,12 +213,111 @@ func loadSetting(key, defaultValue string) string {
 	return value
 }
 
+func loadLogSettings() {
+	setEnableSystemLog(loadSetting("enable_system_log", "true") == "true")
+	setEnableUploadLog(loadSetting("enable_upload_log", "true") == "true")
+}
+
+func getEnableSystemLog() bool {
+	logSettingsMux.RLock()
+	defer logSettingsMux.RUnlock()
+	return enableSystemLog
+}
+
+func setEnableSystemLog(val bool) {
+	logSettingsMux.Lock()
+	enableSystemLog = val
+	logSettingsMux.Unlock()
+}
+
+func getEnableUploadLog() bool {
+	logSettingsMux.RLock()
+	defer logSettingsMux.RUnlock()
+	return enableUploadLog
+}
+
+func setEnableUploadLog(val bool) {
+	logSettingsMux.Lock()
+	enableUploadLog = val
+	logSettingsMux.Unlock()
+}
+
 func addLog(msg string) {
-	timestamp := time.Now().Format("15:04:05")
-	if logEntry != nil {
-		logEntry.SetText(logEntry.Text + fmt.Sprintf("[%s] %s\n", timestamp, msg))
-		logEntry.CursorColumn = 0
-		logEntry.CursorRow = len(logEntry.Text)
+	lowerMsg := strings.ToLower(msg)
+	isError := strings.Contains(lowerMsg, "error") || strings.Contains(lowerMsg, "failed") || strings.Contains(lowerMsg, "fail") || strings.Contains(lowerMsg, "crash") || strings.Contains(lowerMsg, "rejected")
+
+	if getEnableSystemLog() {
+		// Non-blocking enqueue to UI (throttled in a dedicated goroutine).
+		// Never call Fyne widget methods directly from HTTP goroutines.
+		timestamp := time.Now().Format("15:04:05")
+		line := fmt.Sprintf("[%s] %s\n", timestamp, msg)
+		logChOnce.Do(func() {
+			logCh = make(chan string, 2048)
+			logUIStopCh = make(chan struct{})
+			logUIUpdaterOn = true
+
+			go func() {
+				defer func() {
+					logUIUpdaterOn = false
+					if logUIStopCh != nil {
+						close(logUIStopCh)
+					}
+				}()
+
+				// Throttle: apply batch updates every ~150ms to avoid Fyne Entry panics.
+				ticker := time.NewTicker(150 * time.Millisecond)
+				defer ticker.Stop()
+
+				var pending strings.Builder
+				flush := func() {
+					if pending.Len() == 0 || logEntry == nil {
+						pending.Reset()
+						return
+					}
+					appendText := pending.String()
+					pending.Reset()
+
+					fyne.CurrentApp().Driver().DoFromGoroutine(func() {
+						const maxChars = 120_000
+						newText := logEntry.Text + appendText
+						if len(newText) > maxChars {
+							newText = newText[len(newText)-maxChars:]
+						}
+						logEntry.SetText(newText)
+						logEntry.CursorColumn = 0
+						logEntry.CursorRow = len(newText)
+					}, false)
+				}
+
+				for {
+					select {
+					case s := <-logCh:
+						pending.WriteString(s)
+					case <-ticker.C:
+						flush()
+					case <-logUIStopCh:
+						flush()
+						return
+					}
+				}
+			}()
+		})
+
+		// Non-blocking enqueue to avoid deadlocks under heavy load.
+		if logUIUpdaterOn && logCh != nil {
+			select {
+			case logCh <- line:
+			default:
+				// If channel is full, drop to protect UI.
+			}
+		}
+	}
+
+	// File logging (keep original semantics for errors even if UI log is disabled).
+	if isError {
+		logMutex.Lock()
+		writeToErrorLog("ERROR", msg)
+		logMutex.Unlock()
 	}
 }
 
@@ -218,7 +359,6 @@ func loadWatchers() {
 		if err != nil {
 			continue
 		}
-		// Parsing SQLite datetimes
 		t, err := time.Parse("2006-01-02T15:04:05Z07:00", lastSeenStr)
 		if err != nil {
 			t, err = time.Parse("2006-01-02 15:04:05.999999999-07:00", lastSeenStr)
@@ -279,6 +419,9 @@ func loadLogs() {
 }
 
 func logUploadAttempt(watcherUUID, endpoint, filename, status string, t time.Time) {
+	if !getEnableUploadLog() {
+		return
+	}
 	_, err := db.Exec("INSERT INTO upload_logs (watcher_uuid, endpoint, filename, status, uploaded_at) VALUES (?, ?, ?, ?, ?)",
 		watcherUUID, endpoint, filename, status, t)
 	if err != nil {
@@ -288,17 +431,18 @@ func logUploadAttempt(watcherUUID, endpoint, filename, status string, t time.Tim
 
 func startWatcherOfflineMonitor() {
 	go func() {
+		defer handlePanic("WatcherOfflineMonitor")
 		for {
 			time.Sleep(15 * time.Second)
 			serverLock.Lock()
 			running := isRunning
 			serverLock.Unlock()
-
 			if running {
 				cutoff := time.Now().Add(-75 * time.Second)
 				_, err := db.Exec("UPDATE watchers SET status = 'Offline' WHERE last_seen < ? AND status = 'Online'", cutoff)
 				if err != nil {
 					fmt.Printf("Error checking offline watchers: %v\n", err)
+					writeToErrorLog("DB_ERROR", fmt.Sprintf("Error checking offline watchers: %v", err))
 				}
 			}
 		}
@@ -307,7 +451,6 @@ func startWatcherOfflineMonitor() {
 
 func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 	w.Header().Set("Content-Type", "application/json")
-
 	watcherUUID := r.Header.Get("X-Watcher-UUID")
 	if watcherUUID == "" {
 		watcherUUID = "Direct/Manual"
@@ -378,7 +521,7 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 	n, _ := file.Read(buf)
 	file.Seek(0, io.SeekStart)
 	detectedMime := http.DetectContentType(buf[:n])
-	
+
 	if strings.Contains(detectedMime, "application/x-dosexec") || strings.Contains(detectedMime, "application/x-msdownload") {
 		logUploadAttempt(watcherUUID, ep.Endpoint, filename, "Rejected: Executable MIME blocked", time.Now())
 		w.WriteHeader(http.StatusBadRequest)
@@ -429,7 +572,6 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
 	type PathPayload struct {
 		Folder   string `json:"folder"`
 		Endpoint string `json:"endpoint"`
@@ -479,7 +621,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	addLog(fmt.Sprintf("Watcher registered: %s (%s) with %d paths", payload.WatcherName, payload.WatcherUUID, len(payload.Paths)))
-	
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
@@ -490,7 +632,6 @@ func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
 	type HeartbeatPayload struct {
 		WatcherUUID string `json:"watcher_uuid"`
 	}
@@ -551,20 +692,19 @@ func refreshLogsTable() {
 func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("e.g. PEBJF Uploads")
-	
 	endpointEntry := widget.NewEntry()
 	endpointEntry.SetPlaceHolder("e.g. /upload/pebjf")
-	
+
 	extEntry := widget.NewEntry()
 	extEntry.SetPlaceHolder("e.g. .pdf,.txt (comma-separated or empty for all)")
-	
+
 	folderEntry := widget.NewEntry()
 	folderEntry.SetPlaceHolder("Path to save uploaded files")
-	
+
 	sizeEntry := widget.NewEntry()
 	sizeEntry.SetText("10")
 	sizeEntry.SetPlaceHolder("e.g. 10")
-	
+
 	tokenEntry := widget.NewEntry()
 	tokenEntry.SetPlaceHolder("Optional Bearer Token")
 
@@ -589,10 +729,10 @@ func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 		if !save {
 			return
 		}
-		
+
 		epStr := strings.TrimSpace(endpointEntry.Text)
 		folderStr := strings.TrimSpace(folderEntry.Text)
-		
+
 		if epStr == "" || folderStr == "" {
 			dialog.ShowError(fmt.Errorf("Endpoint and Destination Folder are required fields"), parent)
 			return
@@ -600,7 +740,7 @@ func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 		if !strings.HasPrefix(epStr, "/") {
 			epStr = "/" + epStr
 		}
-		
+
 		var maxMB int
 		fmt.Sscanf(sizeEntry.Text, "%d", &maxMB)
 		if maxMB <= 0 {
@@ -616,7 +756,7 @@ func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 			onSave()
 		}
 	}, parent)
-	
+
 	d.Resize(fyne.NewSize(500, 380))
 	d.Show()
 }
@@ -624,19 +764,18 @@ func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 func showEditEndpointDialog(parent fyne.Window, ep Endpoint, onSave func()) {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(ep.Name)
-	
 	endpointEntry := widget.NewEntry()
 	endpointEntry.SetText(ep.Endpoint)
-	
+
 	extEntry := widget.NewEntry()
 	extEntry.SetText(ep.AllowedExtension)
-	
+
 	folderEntry := widget.NewEntry()
 	folderEntry.SetText(ep.DestinationFolder)
-	
+
 	sizeEntry := widget.NewEntry()
 	sizeEntry.SetText(fmt.Sprintf("%d", ep.MaxSizeMB))
-	
+
 	tokenEntry := widget.NewEntry()
 	tokenEntry.SetText(ep.AuthToken)
 
@@ -661,10 +800,10 @@ func showEditEndpointDialog(parent fyne.Window, ep Endpoint, onSave func()) {
 		if !save {
 			return
 		}
-		
+
 		epStr := strings.TrimSpace(endpointEntry.Text)
 		folderStr := strings.TrimSpace(folderEntry.Text)
-		
+
 		if epStr == "" || folderStr == "" {
 			dialog.ShowError(fmt.Errorf("Endpoint and Destination Folder are required fields"), parent)
 			return
@@ -672,7 +811,7 @@ func showEditEndpointDialog(parent fyne.Window, ep Endpoint, onSave func()) {
 		if !strings.HasPrefix(epStr, "/") {
 			epStr = "/" + epStr
 		}
-		
+
 		var maxMB int
 		fmt.Sscanf(sizeEntry.Text, "%d", &maxMB)
 		if maxMB <= 0 {
@@ -687,13 +826,15 @@ func showEditEndpointDialog(parent fyne.Window, ep Endpoint, onSave func()) {
 			onSave()
 		}
 	}, parent)
-	
+
 	d.Resize(fyne.NewSize(500, 380))
 	d.Show()
 }
 
 func main() {
+	defer handlePanic("Main")
 	initDB()
+	loadLogSettings() // Muat pengaturan toggle log
 	startWatcherOfflineMonitor()
 
 	myApp := app.New()
@@ -701,22 +842,19 @@ func main() {
 	myWindow = myApp.NewWindow("Central Upload Server & Dashboard")
 	myWindow.Resize(fyne.NewSize(850, 550))
 
-	// Global Server Control UI Elements
 	portEntry := widget.NewEntry()
 	portEntry.SetText(loadSetting("port", "8080"))
 	portEntry.SetPlaceHolder("Port (e.g. 8080)")
 
 	statusLabel := widget.NewLabel("🔴 Server Stopped")
 
-	// Pre-load data
 	loadEndpoints()
 	loadWatchers()
 	loadLogs()
 
-	// ---------------- TAB 1: Endpoint Manager ----------------
 	endpointsTable = widget.NewTable(
 		func() (int, int) {
-			return len(endpoints) + 1, 6 // 6 columns
+			return len(endpoints) + 1, 6
 		},
 		func() fyne.CanvasObject {
 			return widget.NewLabel("Cell Placeholder text")
@@ -770,24 +908,23 @@ func main() {
 			}
 		},
 	)
-	endpointsTable.SetColumnWidth(0, 110) // Endpoint
-	endpointsTable.SetColumnWidth(1, 130) // Name
-	endpointsTable.SetColumnWidth(2, 100) // Ext
-	endpointsTable.SetColumnWidth(3, 80)  // Size
-	endpointsTable.SetColumnWidth(4, 250) // Destination Folder
-	endpointsTable.SetColumnWidth(5, 80)  // Status
+
+	endpointsTable.SetColumnWidth(0, 110)
+	endpointsTable.SetColumnWidth(1, 130)
+	endpointsTable.SetColumnWidth(2, 100)
+	endpointsTable.SetColumnWidth(3, 80)
+	endpointsTable.SetColumnWidth(4, 250)
+	endpointsTable.SetColumnWidth(5, 80)
 
 	endpointsTable.OnSelected = func(id widget.TableCellID) {
 		if id.Row > 0 {
 			selectedEndpointRow = id.Row - 1
 		}
 	}
-	endpointsTable.OnUnselected = func(id widget.TableCellID) {
-		selectedEndpointRow = -1
-	}
+	endpointsTable.OnUnselected = func(widget.TableCellID) { selectedEndpointRow = -1 }
 
 	addBtn := widget.NewButton("Add Endpoint", func() {
-		showAddEndpointDialog(myWindow, refreshEndpointsTable)
+		showAddEndpointDialog(myWindow, func() { refreshEndpointsTable() })
 	})
 
 	editBtn := widget.NewButton("Edit Selected", func() {
@@ -795,7 +932,7 @@ func main() {
 			dialog.ShowInformation("Notification", "Please select an endpoint row from the table first", myWindow)
 			return
 		}
-		showEditEndpointDialog(myWindow, endpoints[selectedEndpointRow], refreshEndpointsTable)
+		showEditEndpointDialog(myWindow, endpoints[selectedEndpointRow], func() { refreshEndpointsTable() })
 	})
 
 	toggleBtn := widget.NewButton("Toggle Status", func() {
@@ -838,14 +975,9 @@ func main() {
 	endpointControls := container.NewHBox(addBtn, editBtn, toggleBtn, deleteBtn)
 	endpointsContainer := container.NewBorder(nil, endpointControls, nil, nil, endpointsTable)
 
-	// ---------------- TAB 2: Watcher Monitor ----------------
 	watchersTable = widget.NewTable(
-		func() (int, int) {
-			return len(watchersList) + 1, 4
-		},
-		func() fyne.CanvasObject {
-			return widget.NewLabel("Watcher Table Cell text placeholder")
-		},
+		func() (int, int) { return len(watchersList) + 1, 4 },
+		func() fyne.CanvasObject { return widget.NewLabel("Watcher Table Cell text placeholder") },
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
 			if id.Row == 0 {
@@ -883,10 +1015,10 @@ func main() {
 			}
 		},
 	)
-	watchersTable.SetColumnWidth(0, 150) // Name
-	watchersTable.SetColumnWidth(1, 110) // IP
-	watchersTable.SetColumnWidth(2, 90)  // Status
-	watchersTable.SetColumnWidth(3, 150) // Last Seen
+	watchersTable.SetColumnWidth(0, 150)
+	watchersTable.SetColumnWidth(1, 110)
+	watchersTable.SetColumnWidth(2, 90)
+	watchersTable.SetColumnWidth(3, 150)
 
 	watcherDetailsLabel = widget.NewLabel("Select a watcher to view details")
 	watcherDetailsLabel.TextStyle = fyne.TextStyle{Bold: true}
@@ -897,7 +1029,6 @@ func main() {
 		if id.Row > 0 && id.Row-1 < len(watchersList) {
 			selectedWatcherRow = id.Row - 1
 			w := watchersList[selectedWatcherRow]
-
 			paths := loadWatcherPaths(w.UUID)
 			var pathLines []string
 			for _, p := range paths {
@@ -914,8 +1045,7 @@ func main() {
 			}
 		}
 	}
-
-	watchersTable.OnUnselected = func(id widget.TableCellID) {
+	watchersTable.OnUnselected = func(widget.TableCellID) {
 		selectedWatcherRow = -1
 		watcherDetailsLabel.SetText("Select a watcher to view details")
 		watcherPathsList.SetText("")
@@ -930,14 +1060,9 @@ func main() {
 	watcherSplit := container.NewHSplit(watchersTable, watcherRightPanel)
 	watcherSplit.Offset = 0.55
 
-	// ---------------- TAB 3: Upload Logs ----------------
 	logsTable = widget.NewTable(
-		func() (int, int) {
-			return len(logsList) + 1, 5
-		},
-		func() fyne.CanvasObject {
-			return widget.NewLabel("Logs Table Cell text placeholder")
-		},
+		func() (int, int) { return len(logsList) + 1, 5 },
+		func() fyne.CanvasObject { return widget.NewLabel("Logs Table Cell text placeholder") },
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
 			if id.Row == 0 {
@@ -975,13 +1100,21 @@ func main() {
 			}
 		},
 	)
-	logsTable.SetColumnWidth(0, 140) // Timestamp
-	logsTable.SetColumnWidth(1, 200) // Filename
-	logsTable.SetColumnWidth(2, 130) // Watcher
-	logsTable.SetColumnWidth(3, 110) // Endpoint
-	logsTable.SetColumnWidth(4, 200) // Status
+	logsTable.SetColumnWidth(0, 140)
+	logsTable.SetColumnWidth(1, 200)
+	logsTable.SetColumnWidth(2, 130)
+	logsTable.SetColumnWidth(3, 110)
+	logsTable.SetColumnWidth(4, 200)
+
+	// --- UPLOAD LOG TOGGLE ---
+	uploadLogToggle := widget.NewCheck("Enable Upload Logging", func(checked bool) {
+		setEnableUploadLog(checked)
+		saveSetting("enable_upload_log", fmt.Sprintf("%t", checked))
+	})
+	uploadLogToggle.Checked = getEnableUploadLog()
 
 	logsControls := container.NewHBox(
+		uploadLogToggle,
 		widget.NewButton("Clear Logs History", func() {
 			dialog.ShowConfirm("Clear Logs", "Are you sure you want to clear ALL upload logs from the database?", func(confirm bool) {
 				if confirm {
@@ -995,24 +1128,31 @@ func main() {
 			}, myWindow)
 		}),
 	)
+
 	logsContainer := container.NewBorder(nil, logsControls, nil, nil, logsTable)
 
-	// ---------------- TAB 4: System Logs ----------------
 	logEntry = widget.NewMultiLineEntry()
 	logEntry.Disable()
 	logEntry.Wrapping = fyne.TextWrapBreak
 	scrollSystemLogs := container.NewScroll(logEntry)
 
+	// --- SYSTEM LOG TOGGLE ---
+	systemLogToggle := widget.NewCheck("Enable System Logging", func(checked bool) {
+		setEnableSystemLog(checked)
+		saveSetting("enable_system_log", fmt.Sprintf("%t", checked))
+	})
+	systemLogToggle.Checked = getEnableSystemLog()
+
 	systemLogsContainer := container.NewBorder(
 		nil,
-		widget.NewButton("Clear Console Logs", func() {
-			logEntry.SetText("")
-		}),
+		container.NewHBox(
+			systemLogToggle,
+			widget.NewButton("Clear Console Logs", func() { logEntry.SetText("") }),
+		),
 		nil, nil,
 		scrollSystemLogs,
 	)
 
-	// Assemble Tabs
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Endpoint Manager", endpointsContainer),
 		container.NewTabItem("Watcher Monitor", watcherSplit),
@@ -1020,14 +1160,12 @@ func main() {
 		container.NewTabItem("System Logs", systemLogsContainer),
 	)
 
-	// Server Start/Stop Logic
 	var startStopBtn *widget.Button
 	startStopBtn = widget.NewButton("Start Server", func() {
 		serverLock.Lock()
 		defer serverLock.Unlock()
 
 		if isRunning {
-			// Stop Server
 			if server != nil {
 				addLog("Stopping HTTP server...")
 				server.Close()
@@ -1036,90 +1174,89 @@ func main() {
 				startStopBtn.SetText("Start Server")
 				portEntry.Enable()
 			}
-		} else {
-			// Start Server
-			port := portEntry.Text
-			if port == "" {
-				dialog.ShowInformation("Error", "Server port is required", myWindow)
-				return
-			}
-
-			// Save port setting
-			saveSetting("port", port)
-
-			server = &http.Server{
-				Addr: ":" + port,
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					path := strings.TrimSuffix(r.URL.Path, "/")
-					
-					// Handle central API registration and heartbeats
-					if path == "/watcher/register" {
-						handleRegister(w, r)
-						return
-					}
-					if path == "/watcher/heartbeat" {
-						handleHeartbeat(w, r)
-						return
-					}
-
-					// Dynamic endpoints lookup in DB
-					var ep Endpoint
-					var enabledInt int
-					var allowedExt, authToken sql.NullString
-					err := db.QueryRow("SELECT id, name, endpoint, allowed_extension, destination_folder, max_size_mb, enabled, auth_token FROM upload_endpoints WHERE endpoint = ?", path).
-						Scan(&ep.ID, &ep.Name, &ep.Endpoint, &allowedExt, &ep.DestinationFolder, &ep.MaxSizeMB, &enabledInt, &authToken)
-					
-					if err != nil {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusNotFound)
-						json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "API endpoint not found"})
-						return
-					}
-
-					ep.AllowedExtension = allowedExt.String
-					ep.AuthToken = authToken.String
-					ep.Enabled = enabledInt == 1
-
-					if !ep.Enabled {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusForbidden)
-						json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "This endpoint is disabled"})
-						return
-					}
-
-					// Process multipart file upload
-					handleUploadCentral(w, r, ep)
-				}),
-			}
-
-			go func() {
-				addLog(fmt.Sprintf("Server launching on port %s...", port))
-				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					addLog(fmt.Sprintf("HTTP Server error: %v", err))
-					serverLock.Lock()
-					isRunning = false
-					statusLabel.SetText("⚠️ Server Error / Stopped")
-					startStopBtn.SetText("Start Server")
-					portEntry.Enable()
-					serverLock.Unlock()
-				}
-			}()
-
-			isRunning = true
-			statusLabel.SetText("🟢 Server Running")
-			startStopBtn.SetText("Stop Server")
-			portEntry.Disable()
+			return
 		}
+
+		port := portEntry.Text
+		if port == "" {
+			dialog.ShowInformation("Error", "Server port is required", myWindow)
+			return
+		}
+
+		saveSetting("port", port)
+
+		server = &http.Server{
+			Addr: ":" + port,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer handlePanic(fmt.Sprintf("HTTPRequest-%s-%s", r.Method, r.URL.Path))
+				path := strings.TrimSuffix(r.URL.Path, "/")
+
+				if path == "/watcher/register" {
+					handleRegister(w, r)
+					return
+				}
+				if path == "/watcher/heartbeat" {
+					handleHeartbeat(w, r)
+					return
+				}
+
+				var ep Endpoint
+				var enabledInt int
+				var allowedExt, authToken sql.NullString
+				err := db.QueryRow(
+					"SELECT id, name, endpoint, allowed_extension, destination_folder, max_size_mb, enabled, auth_token FROM upload_endpoints WHERE endpoint = ?",
+					path,
+				).Scan(&ep.ID, &ep.Name, &ep.Endpoint, &allowedExt, &ep.DestinationFolder, &ep.MaxSizeMB, &enabledInt, &authToken)
+
+				if err != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusNotFound)
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "API endpoint not found"})
+					return
+				}
+
+				ep.AllowedExtension = allowedExt.String
+				ep.AuthToken = authToken.String
+				ep.Enabled = enabledInt == 1
+
+				if !ep.Enabled {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "This endpoint is disabled"})
+					return
+				}
+
+				handleUploadCentral(w, r, ep)
+			}),
+		}
+
+		go func() {
+			defer handlePanic("HTTPServerListen")
+			addLog(fmt.Sprintf("Server launching on port %s...", port))
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				addLog(fmt.Sprintf("HTTP Server error: %v", err))
+				serverLock.Lock()
+				isRunning = false
+				statusLabel.SetText("⚠️ Server Error / Stopped")
+				startStopBtn.SetText("Start Server")
+				portEntry.Enable()
+				serverLock.Unlock()
+			}
+		}()
+
+		isRunning = true
+		statusLabel.SetText("🟢 Server Running")
+		startStopBtn.SetText("Stop Server")
+		portEntry.Disable()
 	})
 
-	// Background UI Refresh loop for watchers and logs
 	go func() {
+		defer handlePanic("UIRefreshLoop")
 		for {
 			time.Sleep(3 * time.Second)
 			serverLock.Lock()
 			running := isRunning
 			serverLock.Unlock()
-
 			if running {
 				refreshWatchersTable()
 				refreshLogsTable()
@@ -1136,21 +1273,14 @@ func main() {
 		),
 	)
 
-	finalLayout := container.NewBorder(
-		topLayout,
-		nil, nil, nil,
-		tabs,
-	)
-
+	finalLayout := container.NewBorder(topLayout, nil, nil, nil, tabs)
 	myWindow.SetContent(finalLayout)
 
-	// Close interception for System Tray (minimize to tray)
 	myWindow.SetCloseIntercept(func() {
 		myWindow.Hide()
 		addLog("Dashboard hidden to System Tray. Restore from system tray menu.")
 	})
 
-	// Setup System Tray Icon & Menu
 	if desk, ok := myApp.(desktop.App); ok {
 		icon := fyne.NewStaticResource("DocUploader.png", defaultIconBytes)
 		desk.SetSystemTrayIcon(icon)
@@ -1160,9 +1290,7 @@ func main() {
 				myWindow.Show()
 				myWindow.RequestFocus()
 			}),
-			fyne.NewMenuItem("Exit Server", func() {
-				myApp.Quit()
-			}),
+			fyne.NewMenuItem("Exit Server", func() { myApp.Quit() }),
 		)
 		desk.SetSystemTrayMenu(menu)
 	}

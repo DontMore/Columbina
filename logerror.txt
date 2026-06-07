@@ -1,0 +1,114 @@
+[2026-06-04 07:15:57] [CRASH] CRASH PANIC in goroutine [HTTPRequest-POST-/upload/aas]: runtime error: slice bounds out of range [:1266] with capacity 32
+Stack Trace:
+goroutine 17376 [running]:
+runtime/debug.Stack()
+	C:/Program Files/Go/src/runtime/debug/stack.go:26 +0x5e
+main.handlePanic({0xc01ddec040, 0x1c})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:110 +0x58
+panic({0x7ff6584a1780?, 0xc0001a55c0?})
+	C:/Program Files/Go/src/runtime/panic.go:783 +0x132
+fyne.io/fyne/v2/widget.(*textRenderer).Refresh(0xc0017d9f00)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/richtext.go:701 +0xb9b
+fyne.io/fyne/v2/widget.(*BaseWidget).Refresh(0xc0003c4840?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/widget.go:127 +0x52
+fyne.io/fyne/v2/widget.(*RichText).Refresh(0xc0003c4840)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/richtext.go:109 +0x7d
+fyne.io/fyne/v2/widget.(*entryRenderer).Refresh(0xc00032d200)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1653 +0xb8
+fyne.io/fyne/v2/widget.(*BaseWidget).Refresh(0xc0003c4708?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/widget.go:127 +0x52
+fyne.io/fyne/v2/widget.(*Entry).Refresh(0xc0003c4708?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:456 +0xb1
+fyne.io/fyne/v2/widget.(*Entry).updateTextAndRefresh(0xc0003c4708, {0xc004b40000, 0x1eb90}, 0x56?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1422 +0x6c
+fyne.io/fyne/v2/widget.(*Entry).setText(0xc0003c4708, {0xc004b40000, 0x1eb90}, 0x0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:505 +0x46
+fyne.io/fyne/v2/widget.(*Entry).SetText(...)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:500
+main.addLog({0xc01e14a0a0, 0x4a})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:213 +0x145
+main.handleUploadCentral({0x7ff658653f60, 0xc00f67c3c0}, 0xc00fa32140, {0x2, {0xc0062b0368, 0x3}, {0xc0062b0370, 0xb}, {0xc0062b036c, 0x4}, ...})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:391 +0x56a
+main.main.func20.1({0x7ff658653f60, 0xc00f67c3c0}, 0xc00fa32140)
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:1136 +0x550
+net/http.HandlerFunc.ServeHTTP(0x7ff65717bea5?, {0x7ff658653f60?, 0xc00f67c3c0?}, 0xc00d5b0030?)
+	C:/Program Files/Go/src/net/http/server.go:2322 +0x29
+net/http.serverHandler.ServeHTTP({0x7ff658650eb0?}, {0x7ff658653f60?, 0xc00f67c3c0?}, 0x1?)
+	C:/Program Files/Go/src/net/http/server.go:3340 +0x8e
+net/http.(*conn).serve(0xc0016bc1b0, {0x7ff658655590, 0xc0017caf60})
+	C:/Program Files/Go/src/net/http/server.go:2109 +0x665
+created by net/http.(*Server).Serve in goroutine 82
+	C:/Program Files/Go/src/net/http/server.go:3493 +0x485
+
+----------------------------------------
+
+[2026-06-04 07:15:57] [ERROR] CRITICAL CRASH detected in HTTPRequest-POST-/upload/aas! Details written to logerror.txt
+[2026-06-04 16:04:59] [CRASH] CRASH PANIC in goroutine [HTTPRequest-POST-/upload/aas]: runtime error: slice bounds out of range [:16614] with capacity 32
+Stack Trace:
+goroutine 22591 [running]:
+runtime/debug.Stack()
+	C:/Program Files/Go/src/runtime/debug/stack.go:26 +0x5e
+main.handlePanic({0xc00581a040, 0x1c})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:110 +0x58
+panic({0x7ff6584a1780?, 0xc007126018?})
+	C:/Program Files/Go/src/runtime/panic.go:783 +0x132
+fyne.io/fyne/v2/widget.(*textRenderer).Refresh(0xc0084c4000)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/richtext.go:701 +0xb9b
+fyne.io/fyne/v2/widget.(*BaseWidget).Refresh(0xc0003c4840?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/widget.go:127 +0x52
+fyne.io/fyne/v2/widget.(*RichText).Refresh(0xc0003c4840)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/richtext.go:109 +0x7d
+fyne.io/fyne/v2/widget.(*RichText).Resize(0xc0003c4840, {0x0?, 0x0?})
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/richtext.go:131 +0xc5
+fyne.io/fyne/v2/widget.(*entryContentRenderer).Layout(0xc0093b23c0, {0x2d8e050?, 0xc0?})
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1798 +0x28
+fyne.io/fyne/v2/widget.(*BaseWidget).Resize(0x7ff6584ba400?, {0x58650bd0?, 0x7ff6?})
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/widget.go:51 +0x6b
+fyne.io/fyne/v2/internal/widget.(*scrollContainerRenderer).Layout(0xc0031a0600, {0x0, 0x0})
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/scroller.go:391 +0x87
+fyne.io/fyne/v2/internal/widget.(*scrollContainerRenderer).Refresh(0xc0031a0600)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/scroller.go:421 +0x1ee
+fyne.io/fyne/v2/internal/widget.(*Base).Refresh(0xc0031a01e0?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/base.go:120 +0x2e
+fyne.io/fyne/v2/internal/widget.(*Scroll).refreshWithoutOffsetUpdate(...)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/scroller.go:582
+fyne.io/fyne/v2/internal/widget.(*Scroll).refreshBars(0xc0031a01e0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/scroller.go:594 +0x2b
+fyne.io/fyne/v2/internal/widget.(*Scroll).ScrollToOffset(...)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/internal/widget/scroller.go:578
+fyne.io/fyne/v2/widget.(*entryContentRenderer).ensureCursorVisible(0xc0093b23c0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1885 +0x205
+fyne.io/fyne/v2/widget.(*entryContentRenderer).moveCursor(0xc0093b23c0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1902 +0x1ae
+fyne.io/fyne/v2/widget.(*entryContentRenderer).Refresh(0xc0093b23c0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1847 +0x2a5
+fyne.io/fyne/v2/widget.(*entryRenderer).Refresh(0xc0093b2340)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1726 +0x6ae
+fyne.io/fyne/v2/widget.(*BaseWidget).Refresh(0xc0003c4708?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/widget.go:127 +0x52
+fyne.io/fyne/v2/widget.(*Entry).Refresh(0xc0003c4708?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:456 +0xb1
+fyne.io/fyne/v2/widget.(*Entry).updateTextAndRefresh(0xc0003c4708, {0xc002bf0000, 0xc1d9}, 0x52?)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:1422 +0x6c
+fyne.io/fyne/v2/widget.(*Entry).setText(0xc0003c4708, {0xc002bf0000, 0xc1d9}, 0x0)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:505 +0x46
+fyne.io/fyne/v2/widget.(*Entry).SetText(...)
+	C:/Users/Administrator/go/pkg/mod/fyne.io/fyne/v2@v2.7.4/widget/entry.go:500
+main.addLog({0xc0094a6050, 0x46})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:213 +0x145
+main.handleUploadCentral({0x7ff658653f60, 0xc002db81e0}, 0xc00fabe140, {0x2, {0xc0092cfba0, 0x3}, {0xc0092cfba3, 0xb}, {0xc0092cfbb0, 0x4}, ...})
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:391 +0x56a
+main.main.func20.1({0x7ff658653f60, 0xc002db81e0}, 0xc00fabe140)
+	D:/Coding/Columbina/cmd/doc-uploader/main.go:1136 +0x550
+net/http.HandlerFunc.ServeHTTP(0x7ff65717bea5?, {0x7ff658653f60?, 0xc002db81e0?}, 0xc002bd4020?)
+	C:/Program Files/Go/src/net/http/server.go:2322 +0x29
+net/http.serverHandler.ServeHTTP({0x7ff658650eb0?}, {0x7ff658653f60?, 0xc002db81e0?}, 0x1?)
+	C:/Program Files/Go/src/net/http/server.go:3340 +0x8e
+net/http.(*conn).serve(0xc0016bc1b0, {0x7ff658655590, 0xc0017caf60})
+	C:/Program Files/Go/src/net/http/server.go:2109 +0x665
+created by net/http.(*Server).Serve in goroutine 82
+	C:/Program Files/Go/src/net/http/server.go:3493 +0x485
+
+----------------------------------------
+
+[2026-06-04 16:04:59] [ERROR] CRITICAL CRASH detected in HTTPRequest-POST-/upload/aas! Details written to logerror.txt

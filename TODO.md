@@ -1,0 +1,4 @@
+- [x] Implement safe, throttled UI log updates in `cmd/doc-uploader/main.go` to prevent Fyne Entry crashes.
+- [x] Keep existing error-file logging behavior (`logerror.txt`) intact.
+- [x] Add automated guardrails in `addLog` (channel + single UI updater goroutine).
+- [ ] Verify build succeeds and run quick sanity check (trigger `/upload/` and confirm no panic).

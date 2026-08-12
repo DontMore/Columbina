@@ -70,12 +70,12 @@ Kedua aplikasi menggunakan **Modern Slate Theme** yang sangat elegan, dengan lat
 
 ### 1. Compile the DocUploader Server
 ```bash
-go build -ldflags="-H=windowsgui" -o bin/DocUploader.exe ./cmd/doc-uploader
+fyne package -os windows -icon DocUploader.png -name FileUploader --app-id com.columbina.docuploader -release
 ```
 
 ### 2. Compile the FileWatcher Client
 ```bash
-go build -ldflags="-H=windowsgui" -o bin/FileWatcher.exe ./cmd/file-watcher
+fyne package -os windows -icon FileWatcher.png -name FileWatcher --app-id com.columbina.filewatcher -release
 ```
 *(The `-ldflags="-H=windowsgui"` flag prevents the command prompt terminal from showing up on startup in Windows).*
 

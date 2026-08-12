@@ -24,3 +24,6 @@ Desktop.ini
 *.njsproj
 *.sln
 *.swp
+
+# zip
+*.zip

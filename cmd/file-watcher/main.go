@@ -80,6 +80,7 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	locked, err := lock.TryLock()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FileWatcher lock error: %v\n", err)
+
 		// Jika lock error, tetap lanjutkan aplikasi agar tidak mati total.
 		return true
 	}
@@ -196,7 +197,7 @@ func main() {
 	defer stopSingleInstanceGuard()
 
 	initDB()
-	logEnabled = loadSetting("enable_log", "true") == "true"
+
 	loadWatchPaths()
 	startHeartbeatLoop()
 	startRetryLoop()
@@ -205,7 +206,7 @@ func main() {
 	myApp.Settings().SetTheme(ui.ModernTheme{})
 
 	myWindow = myApp.NewWindow("File Watcher Client")
-	myWindow.Resize(fyne.NewSize(720, 560))
+	myWindow.Resize(fyne.NewSize(720, 520))
 
 	pathsTable = widget.NewTable(
 		func() (int, int) {
@@ -284,7 +285,7 @@ func main() {
 
 	uuidLabel := widget.NewLabel("Watcher UUID: " + loadSetting("watcher_uuid", "N/A"))
 
-	// Inisialisasi awal lingkaran Vektor Grafis (Default Merah)
+	// Inisialisasi awal lingkaran Vektor Grafis (default merah)
 	serverStatusDot = canvas.NewCircle(color.NRGBA{R: 231, G: 76, B: 60, A: 255})
 
 	// Membungkus lingkaran ke dalam GridWrap container untuk memaksakan ukurannya menjadi 14x14 piksel
@@ -293,7 +294,7 @@ func main() {
 	// Inisialisasi teks keterangan status
 	serverStatusText = widget.NewLabel("Server Not Connected")
 
-	// Menyatukan lingkaran grafis (yang disejajarkan ke tengah) dan teks keterangan status
+	// Menyatukan lingkaran grafis dan teks keterangan status
 	serverStatusBox := container.NewHBox(container.NewCenter(dotContainer), serverStatusText)
 
 	addBtn := widget.NewButton("Add Folder", func() {
@@ -353,39 +354,10 @@ func main() {
 
 	folderControls := container.NewHBox(addBtn, editBtn, toggleBtn, deleteBtn)
 
-	watcherLog = widget.NewMultiLineEntry()
-	watcherLog.Disable()
-	watcherLog.Wrapping = fyne.TextWrapBreak
-
-	scrollLogs := container.NewScroll(watcherLog)
-	scrollLogs.SetMinSize(fyne.NewSize(0, 160))
-
 	statusLabel := widget.NewLabel("🔴 Watcher Stopped")
 
-	enableLogCheck := widget.NewCheck("Enable Activity Logs", func(checked bool) {
-		logEnabledMu.Lock()
-		logEnabled = checked
-		logEnabledMu.Unlock()
-
-		saveSetting("enable_log", fmt.Sprintf("%t", checked))
-
-		if checked {
-			addWatcherLog("Activity logging has been enabled.")
-		}
-	})
-	enableLogCheck.SetChecked(logEnabled)
-
-	clearLogBtn := widget.NewButton("Clear", func() {
-		if watcherLog != nil {
-			watcherLog.SetText("")
-		}
-	})
-
-	logHeader := container.NewHBox(
-		widget.NewLabel("Activity Logs:"),
-		enableLogCheck,
-		clearLogBtn,
-	)
+	logInfoLabel := widget.NewLabel("Activity logs are written to: data/file-watcher.log")
+	logInfoLabel.TextStyle = fyne.TextStyle{Italic: true}
 
 	var startStopBtn *widget.Button
 
@@ -543,8 +515,7 @@ func main() {
 		container.NewVBox(
 			startStopBtn,
 			statusLabel,
-			logHeader,
-			scrollLogs,
+			logInfoLabel,
 		),
 		nil, nil,
 		pathsTable,

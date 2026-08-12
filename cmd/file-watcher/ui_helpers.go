@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -11,23 +14,28 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-func addWatcherLog(msg string) {
-	logEnabledMu.RLock()
-	enabled := logEnabled
-	logEnabledMu.RUnlock()
+var activityLogMu sync.Mutex
 
-	if !enabled {
+// addWatcherLog menulis activity log ke data/file-watcher.log
+func addWatcherLog(msg string) {
+	activityLogMu.Lock()
+	defer activityLogMu.Unlock()
+
+	_ = os.MkdirAll("data", 0755)
+
+	f, err := os.OpenFile(
+		filepath.Join("data", "file-watcher.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0644,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open file-watcher.log: %v\n", err)
 		return
 	}
+	defer f.Close()
 
-	timestamp := time.Now().Format("15:04:05")
-	if watcherLog != nil {
-		fyne.CurrentApp().Driver().DoFromGoroutine(func() {
-			watcherLog.SetText(watcherLog.Text + fmt.Sprintf("[%s] %s\n", timestamp, msg))
-			watcherLog.CursorColumn = 0
-			watcherLog.CursorRow = len(watcherLog.Text)
-		}, false)
-	}
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, _ = f.WriteString(fmt.Sprintf("[%s] %s\n", timestamp, msg))
 }
 
 func refreshPathsTable() {
@@ -38,6 +46,7 @@ func refreshPathsTable() {
 func showAddPathDialog(parent fyne.Window, onSave func()) {
 	folderEntry := widget.NewEntry()
 	folderEntry.SetPlaceHolder("Local folder path to monitor")
+
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("e.g. http://localhost:8080/upload/pebjf")
 
@@ -71,8 +80,10 @@ func showAddPathDialog(parent fyne.Window, onSave func()) {
 			return
 		}
 
-		_, err := db.Exec("INSERT INTO watch_paths (folder_path, api_url, enabled, bearer_token) VALUES (?, ?, 1, ?)",
-			folder, apiUrl, tokenEntry.Text)
+		_, err := db.Exec(
+			"INSERT INTO watch_paths (folder_path, api_url, enabled, bearer_token) VALUES (?, ?, 1, ?)",
+			folder, apiUrl, tokenEntry.Text,
+		)
 		if err != nil {
 			dialog.ShowError(err, parent)
 		} else {
@@ -87,6 +98,7 @@ func showAddPathDialog(parent fyne.Window, onSave func()) {
 func showEditPathDialog(parent fyne.Window, wp WatchPath, onSave func()) {
 	folderEntry := widget.NewEntry()
 	folderEntry.SetText(wp.FolderPath)
+
 	urlEntry := widget.NewEntry()
 	urlEntry.SetText(wp.ApiUrl)
 
@@ -120,8 +132,10 @@ func showEditPathDialog(parent fyne.Window, wp WatchPath, onSave func()) {
 			return
 		}
 
-		_, err := db.Exec("UPDATE watch_paths SET folder_path = ?, api_url = ?, bearer_token = ? WHERE id = ?",
-			folder, apiUrl, tokenEntry.Text, wp.ID)
+		_, err := db.Exec(
+			"UPDATE watch_paths SET folder_path = ?, api_url = ?, bearer_token = ? WHERE id = ?",
+			folder, apiUrl, tokenEntry.Text, wp.ID,
+		)
 		if err != nil {
 			dialog.ShowError(err, parent)
 		} else {

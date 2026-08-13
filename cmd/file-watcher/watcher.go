@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"image/color"
@@ -272,31 +271,67 @@ func startRetryLoop() {
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
+
 			watcherLock.Lock()
 			watching := isWatching
 			watcherLock.Unlock()
 
-			if watching {
-				var activePaths []WatchPath
-				rows, err := db.Query("SELECT id, folder_path, api_url, enabled, bearer_token FROM watch_paths WHERE enabled = 1")
-				if err == nil {
-					for rows.Next() {
-						var wp WatchPath
-						var enabledInt int
-						var token sql.NullString
-						rows.Scan(&wp.ID, &wp.FolderPath, &wp.ApiUrl, &enabledInt, &token)
-						wp.Enabled = enabledInt == 1
-						wp.BearerToken = token.String
-						activePaths = append(activePaths, wp)
-					}
-					rows.Close()
-				}
+			if !watching {
+				continue
+			}
 
-				for _, wp := range activePaths {
+			var activePaths []WatchPath
+
+			rows, err := db.Query(`
+				SELECT
+					id,
+					folder_path,
+					api_url,
+					enabled,
+					COALESCE(bearer_token, ''),
+					COALESCE(mode, 'upload'),
+					COALESCE(sync_folder, '')
+				FROM watch_paths
+				WHERE enabled = 1
+			`)
+			if err == nil {
+				for rows.Next() {
+					var wp WatchPath
+					var enabledInt int
+
+					rows.Scan(
+						&wp.ID,
+						&wp.FolderPath,
+						&wp.ApiUrl,
+						&enabledInt,
+						&wp.BearerToken,
+						&wp.Mode,
+						&wp.SyncFolder,
+					)
+
+					wp.Enabled = enabledInt == 1
+
+					if wp.Mode == "" {
+						wp.Mode = "upload"
+					}
+
+					activePaths = append(activePaths, wp)
+				}
+				rows.Close()
+			}
+
+			for _, wp := range activePaths {
+				switch wp.Mode {
+				case "sync_push":
+					runSyncPush(wp)
+				case "sync_pull":
+					runSyncPull(wp)
+				default:
 					files, err := os.ReadDir(wp.FolderPath)
 					if err != nil {
 						continue
 					}
+
 					for _, f := range files {
 						if !f.IsDir() {
 							filePath := filepath.Join(wp.FolderPath, f.Name())

@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -31,7 +33,6 @@ import (
 //go:embed DocUploader.png
 var defaultIconBytes []byte
 
-// Data Models
 type Endpoint struct {
 	ID                int
 	Name              string
@@ -65,6 +66,12 @@ type LogEntry struct {
 	UploadedAt string
 }
 
+type SyncFileMeta struct {
+	RelPath string    `json:"rel_path"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+}
+
 var (
 	server     *http.Server
 	serverLock sync.Mutex
@@ -74,42 +81,34 @@ var (
 	db       *sql.DB
 	myWindow fyne.Window
 
-	// Data stores
 	endpoints    []Endpoint
 	watchersList []WatcherInfo
 	logsList     []LogEntry
 
-	// UI components that need refreshing
 	endpointsTable      *widget.Table
 	watchersTable       *widget.Table
 	logsTable           *widget.Table
 	selectedEndpointRow = -1
 	selectedWatcherRow  = -1
 
-	// Watcher detail UI elements
 	watcherDetailsLabel *widget.Label
 	watcherPathsList    *widget.Entry
 
-	// Mutex to protect concurrent logging to log file and dedupe throttling
 	logMutex sync.Mutex
 
-	// Throttled UI logging to prevent Fyne Entry panics
 	logCh          chan string
 	logChOnce      sync.Once
 	logUIStopCh    chan struct{}
 	logUIUpdaterOn bool
 
-	// Log Toggle Settings
 	logSettingsMux  sync.RWMutex
 	enableSystemLog bool
 	enableUploadLog bool
 
-	// Single instance guard
 	singleLock *flock.Flock
 	singleIPC  net.Listener
 )
 
-// Helper to write logs to logerror.txt
 func writeToErrorLog(level string, message string) {
 	_ = os.MkdirAll("data", 0755)
 
@@ -124,7 +123,6 @@ func writeToErrorLog(level string, message string) {
 	_, _ = f.WriteString(fmt.Sprintf("[%s] [%s] %s\n", timestamp, level, message))
 }
 
-// Global panic recovery helper to catch goroutine crashes
 func handlePanic(goroutineName string) {
 	if r := recover(); r != nil {
 		stackTrace := string(debug.Stack())
@@ -133,13 +131,10 @@ func handlePanic(goroutineName string) {
 		fmt.Fprint(os.Stderr, errStr)
 		writeToErrorLog("CRASH", errStr)
 
-		// Attempt safe UI notification
 		addLog(fmt.Sprintf("CRITICAL CRASH detected in %s! Details written to logerror.txt", goroutineName))
 	}
 }
 
-// singleInstanceDir menyimpan file lock dan port IPC di folder konfigurasi user,
-// agar deteksi single instance tetap bekerja walaupun aplikasi dijalankan dari folder berbeda.
 func singleInstanceDir() string {
 	base, err := os.UserConfigDir()
 	if err != nil {
@@ -152,7 +147,6 @@ func singleInstanceDir() string {
 	return dir
 }
 
-// signalExistingInstance mengirim sinyal ke instance pertama yang sedang berjalan.
 func signalExistingInstance() bool {
 	portBytes, err := os.ReadFile(filepath.Join(singleInstanceDir(), "ipc.port"))
 	if err != nil {
@@ -178,9 +172,6 @@ func signalExistingInstance() bool {
 	return err == nil
 }
 
-// startSingleInstanceGuard mencoba mengunci aplikasi sebagai instance pertama.
-// Jika berhasil, aplikasi membuka listener lokal untuk menerima sinyal "SHOW"
-// dari instance kedua.
 func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	dir := singleInstanceDir()
 	lockPath := filepath.Join(dir, "docuploader.lock")
@@ -189,22 +180,19 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 
 	locked, err := lock.TryLock()
 	if err != nil {
-		writeToErrorLog("SINGLE_INSTANCE", fmt.Sprintf("Gagal membaca lock: %v", err))
-		// Jika lock error, tetap lanjutkan aplikasi untuk menghindari aplikasi tidak bisa dibuka sama sekali.
+		fmt.Fprintf(os.Stderr, "DocUploader lock error: %v\n", err)
 		return true
 	}
 
-	// Jika tidak mendapat lock, berarti sudah ada instance lain yang berjalan.
 	if !locked {
 		return false
 	}
 
 	singleLock = lock
 
-	// Instance pertama: buka listener lokal untuk menerima sinyal dari instance kedua.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		writeToErrorLog("SINGLE_INSTANCE", fmt.Sprintf("Gagal membuat IPC listener: %v", err))
+		fmt.Fprintf(os.Stderr, "DocUploader IPC listen error: %v\n", err)
 		return true
 	}
 
@@ -219,13 +207,13 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 
 	ipcPortPath := filepath.Join(dir, "ipc.port")
 	if err := os.WriteFile(ipcPortPath, []byte(strconv.Itoa(tcpAddr.Port)), 0600); err != nil {
-		writeToErrorLog("SINGLE_INSTANCE", fmt.Sprintf("Gagal menyimpan port IPC: %v", err))
+		fmt.Fprintf(os.Stderr, "DocUploader gagal menyimpan port IPC: %v\n", err)
 	}
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				writeToErrorLog("CRASH", fmt.Sprintf("Panic di SingleInstanceIPC: %v", r))
+				fmt.Fprintf(os.Stderr, "DocUploader SingleInstanceIPC panic: %v\n", r)
 			}
 		}()
 
@@ -243,11 +231,9 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 				buf := make([]byte, 16)
 				_, _ = c.Read(buf)
 
-				// Kirim sinyal ke UI untuk menampilkan window.
 				select {
 				case showCh <- struct{}{}:
 				default:
-					// Jika sudah ada sinyal pending, abaikan sinyal tambahan.
 				}
 			}(conn)
 		}
@@ -256,7 +242,6 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	return true
 }
 
-// stopSingleInstanceGuard membersihkan file IPC, menutup listener, dan melepas lock.
 func stopSingleInstanceGuard() {
 	_ = os.Remove(filepath.Join(singleInstanceDir(), "ipc.port"))
 
@@ -271,6 +256,323 @@ func stopSingleInstanceGuard() {
 	}
 }
 
+func syncJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"message": message,
+	})
+}
+
+func safeSyncRelPath(rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	rel = filepath.ToSlash(rel)
+
+	cleaned := path.Clean("/" + rel)
+	cleaned = strings.TrimPrefix(cleaned, "/")
+
+	if cleaned == "" || cleaned == "." {
+		return "", fmt.Errorf("invalid relative path")
+	}
+
+	if strings.Contains(cleaned, "..") {
+		return "", fmt.Errorf("path traversal detected")
+	}
+
+	return cleaned, nil
+}
+
+func syncAuthOK(r *http.Request, ep Endpoint) bool {
+	if ep.AuthToken == "" {
+		return true
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "Bearer "+ep.AuthToken {
+		return true
+	}
+
+	if r.URL.Query().Get("token") == ep.AuthToken {
+		return true
+	}
+
+	return false
+}
+
+func syncExtensionAllowed(allowedExtension string, relPath string) bool {
+	if allowedExtension == "" || allowedExtension == "*" {
+		return true
+	}
+
+	ext := strings.ToLower(filepath.Ext(relPath))
+
+	parts := strings.Split(allowedExtension, ",")
+	for _, p := range parts {
+		item := strings.TrimSpace(strings.ToLower(p))
+		if item == "" {
+			continue
+		}
+
+		if !strings.HasPrefix(item, ".") {
+			item = "." + item
+		}
+
+		if item == ext {
+			return true
+		}
+	}
+
+	return false
+}
+
+func handleSyncRoutes(w http.ResponseWriter, r *http.Request, urlPath string) bool {
+	cleanPath := strings.Trim(urlPath, "/")
+	if !strings.HasPrefix(cleanPath, "sync/") {
+		return false
+	}
+
+	parts := strings.Split(cleanPath, "/")
+	if len(parts) < 2 {
+		return false
+	}
+
+	if db == nil {
+		syncJSONError(w, http.StatusInternalServerError, "Database not ready")
+		return true
+	}
+
+	folderName := parts[1]
+	endpointPath := "/sync/" + folderName
+
+	var ep Endpoint
+	var enabledInt int
+	var allowedExt, authToken sql.NullString
+
+	err := db.QueryRow(`
+		SELECT id, name, endpoint, allowed_extension, destination_folder, max_size_mb, enabled, auth_token
+		FROM upload_endpoints
+		WHERE endpoint = ?
+	`, endpointPath).Scan(
+		&ep.ID,
+		&ep.Name,
+		&ep.Endpoint,
+		&allowedExt,
+		&ep.DestinationFolder,
+		&ep.MaxSizeMB,
+		&enabledInt,
+		&authToken,
+	)
+	if err != nil {
+		syncJSONError(w, http.StatusNotFound, "Sync folder not found")
+		return true
+	}
+
+	ep.AllowedExtension = allowedExt.String
+	ep.AuthToken = authToken.String
+	ep.Enabled = enabledInt == 1
+
+	if !syncAuthOK(r, ep) {
+		syncJSONError(w, http.StatusUnauthorized, "Unauthorized sync token")
+		return true
+	}
+
+	if !ep.Enabled {
+		syncJSONError(w, http.StatusForbidden, "Sync folder is disabled")
+		return true
+	}
+
+	action := "manifest"
+	if len(parts) >= 3 {
+		action = parts[2]
+	}
+
+	switch action {
+	case "manifest":
+		handleSyncManifest(w, r, ep)
+	case "upload":
+		handleSyncUpload(w, r, ep)
+	case "download":
+		handleSyncDownload(w, r, ep)
+	default:
+		syncJSONError(w, http.StatusNotFound, "Invalid sync action")
+	}
+
+	return true
+}
+
+func handleSyncManifest(w http.ResponseWriter, r *http.Request, ep Endpoint) {
+	if r.Method != http.MethodGet {
+		syncJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	root := ep.DestinationFolder
+	_ = os.MkdirAll(root, 0755)
+
+	files := make([]SyncFileMeta, 0)
+
+	err := filepath.WalkDir(root, func(filePath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, filePath)
+		if err != nil {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		files = append(files, SyncFileMeta{
+			RelPath: filepath.ToSlash(rel),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+
+		return nil
+	})
+
+	if err != nil {
+		syncJSONError(w, http.StatusInternalServerError, "Failed to scan sync folder")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"files":   files,
+	})
+}
+
+func handleSyncUpload(w http.ResponseWriter, r *http.Request, ep Endpoint) {
+	if r.Method != http.MethodPost {
+		syncJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	maxMB := ep.MaxSizeMB
+	if maxMB <= 0 {
+		maxMB = 10
+	}
+
+	maxBytes := int64(maxMB) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
+	err := r.ParseMultipartForm(maxBytes)
+	if err != nil {
+		syncJSONError(w, http.StatusBadRequest, fmt.Sprintf("File size exceeds limit of %d MB", maxMB))
+		return
+	}
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		syncJSONError(w, http.StatusBadRequest, "Missing file field")
+		return
+	}
+	defer file.Close()
+
+	relPath := r.FormValue("rel_path")
+	if strings.TrimSpace(relPath) == "" {
+		relPath = handler.Filename
+	}
+
+	cleanRel, err := safeSyncRelPath(relPath)
+	if err != nil {
+		syncJSONError(w, http.StatusBadRequest, "Invalid rel_path")
+		return
+	}
+
+	if !syncExtensionAllowed(ep.AllowedExtension, cleanRel) {
+		syncJSONError(w, http.StatusBadRequest, "Extension not allowed")
+		return
+	}
+
+	destPath := filepath.Join(ep.DestinationFolder, filepath.FromSlash(cleanRel))
+	_ = os.MkdirAll(filepath.Dir(destPath), 0755)
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		syncJSONError(w, http.StatusInternalServerError, "Failed to create destination file")
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		syncJSONError(w, http.StatusInternalServerError, "Failed to save file")
+		return
+	}
+
+	modTimeStr := r.FormValue("mod_time")
+	if modTimeStr != "" {
+		if modTime, err := time.Parse(time.RFC3339, modTimeStr); err == nil {
+			_ = os.Chtimes(destPath, modTime, modTime)
+		}
+	}
+
+	addLog(fmt.Sprintf("[SYNC] Saved sync file: %s", cleanRel))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Sync file saved",
+	})
+}
+
+func handleSyncDownload(w http.ResponseWriter, r *http.Request, ep Endpoint) {
+	if r.Method != http.MethodGet {
+		syncJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	relPath := r.URL.Query().Get("path")
+	if strings.TrimSpace(relPath) == "" {
+		syncJSONError(w, http.StatusBadRequest, "Missing path parameter")
+		return
+	}
+
+	cleanRel, err := safeSyncRelPath(relPath)
+	if err != nil {
+		syncJSONError(w, http.StatusBadRequest, "Invalid path")
+		return
+	}
+
+	fullPath := filepath.Join(ep.DestinationFolder, filepath.FromSlash(cleanRel))
+
+	rootAbs, err := filepath.Abs(ep.DestinationFolder)
+	if err != nil {
+		syncJSONError(w, http.StatusInternalServerError, "Invalid sync folder")
+		return
+	}
+
+	fileAbs, err := filepath.Abs(fullPath)
+	if err != nil {
+		syncJSONError(w, http.StatusInternalServerError, "Invalid file path")
+		return
+	}
+
+	if !strings.HasPrefix(fileAbs, rootAbs+string(os.PathSeparator)) {
+		syncJSONError(w, http.StatusBadRequest, "Path traversal detected")
+		return
+	}
+
+	if _, err := os.Stat(fullPath); err != nil {
+		syncJSONError(w, http.StatusNotFound, "File not found")
+		return
+	}
+
+	http.ServeFile(w, r, fullPath)
+}
+
 func initDB() {
 	_ = os.MkdirAll("data", 0755)
 
@@ -282,13 +584,11 @@ func initDB() {
 		return
 	}
 
-	// Settings Table
 	_, err = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 	if err != nil {
 		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating settings table: %v", err))
 	}
 
-	// Upload Endpoints Table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS upload_endpoints (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT,
@@ -303,7 +603,6 @@ func initDB() {
 		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating upload_endpoints table: %v", err))
 	}
 
-	// Watchers Table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watchers (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		watcher_uuid TEXT UNIQUE,
@@ -316,7 +615,6 @@ func initDB() {
 		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating watchers table: %v", err))
 	}
 
-	// Watcher Paths Table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS watcher_paths (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		watcher_uuid TEXT,
@@ -328,7 +626,6 @@ func initDB() {
 		writeToErrorLog("DB_ERROR", fmt.Sprintf("Error creating watcher_paths table: %v", err))
 	}
 
-	// Upload Logs Table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS upload_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		watcher_uuid TEXT,
@@ -406,8 +703,6 @@ func addLog(msg string) {
 		strings.Contains(lowerMsg, "rejected")
 
 	if getEnableSystemLog() {
-		// Non-blocking enqueue to UI (throttled in a dedicated goroutine).
-		// Never call Fyne widget methods directly from HTTP goroutines.
 		timestamp := time.Now().Format("15:04:05")
 		line := fmt.Sprintf("[%s] %s\n", timestamp, msg)
 
@@ -424,7 +719,6 @@ func addLog(msg string) {
 					}
 				}()
 
-				// Throttle: apply batch updates every ~150ms to avoid Fyne Entry panics.
 				ticker := time.NewTicker(150 * time.Millisecond)
 				defer ticker.Stop()
 
@@ -477,17 +771,14 @@ func addLog(msg string) {
 			}()
 		})
 
-		// Non-blocking enqueue to avoid deadlocks under heavy load.
 		if logUIUpdaterOn && logCh != nil {
 			select {
 			case logCh <- line:
 			default:
-				// If channel is full, drop to protect UI.
 			}
 		}
 	}
 
-	// File logging (keep original semantics for errors even if UI log is disabled).
 	if isError {
 		logMutex.Lock()
 		writeToErrorLog("ERROR", msg)
@@ -496,11 +787,11 @@ func addLog(msg string) {
 }
 
 func loadEndpoints() {
+	endpoints = nil
+
 	if db == nil {
 		return
 	}
-
-	endpoints = nil
 
 	rows, err := db.Query("SELECT id, name, endpoint, allowed_extension, destination_folder, max_size_mb, enabled, auth_token FROM upload_endpoints ORDER BY endpoint ASC")
 	if err != nil {
@@ -528,11 +819,11 @@ func loadEndpoints() {
 }
 
 func loadWatchers() {
+	watchersList = nil
+
 	if db == nil {
 		return
 	}
-
-	watchersList = nil
 
 	rows, err := db.Query("SELECT watcher_uuid, watcher_name, ip_address, last_seen, status FROM watchers ORDER BY last_seen DESC")
 	if err != nil {
@@ -567,11 +858,11 @@ func loadWatchers() {
 }
 
 func loadWatcherPaths(uuid string) []WatcherPath {
-	if db == nil {
-		return nil
-	}
-
 	var paths []WatcherPath
+
+	if db == nil {
+		return paths
+	}
 
 	rows, err := db.Query("SELECT folder_path, endpoint FROM watcher_paths WHERE watcher_uuid = ?", uuid)
 	if err == nil {
@@ -588,11 +879,11 @@ func loadWatcherPaths(uuid string) []WatcherPath {
 }
 
 func loadLogs() {
+	logsList = nil
+
 	if db == nil {
 		return
 	}
-
-	logsList = nil
 
 	rows, err := db.Query("SELECT id, watcher_uuid, endpoint, filename, status, uploaded_at FROM upload_logs ORDER BY uploaded_at DESC LIMIT 150")
 	if err != nil {
@@ -637,10 +928,8 @@ func logUploadAttempt(watcherUUID, endpoint, filename, status string, t time.Tim
 		return
 	}
 
-	_, err := db.Exec(
-		"INSERT INTO upload_logs (watcher_uuid, endpoint, filename, status, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-		watcherUUID, endpoint, filename, status, t,
-	)
+	_, err := db.Exec("INSERT INTO upload_logs (watcher_uuid, endpoint, filename, status, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+		watcherUUID, endpoint, filename, status, t)
 	if err != nil {
 		fmt.Printf("Error logging upload: %v\n", err)
 	}
@@ -678,7 +967,6 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 		watcherUUID = "Direct/Manual"
 	}
 
-	// Validate Auth
 	if ep.AuthToken != "" {
 		authHeader := r.Header.Get("Authorization")
 		expectedAuth := "Bearer " + ep.AuthToken
@@ -691,14 +979,19 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 		}
 	}
 
-	// Max upload size limit (maxSizeMB)
-	r.Body = http.MaxBytesReader(w, r.Body, int64(ep.MaxSizeMB)<<20)
+	maxMB := ep.MaxSizeMB
+	if maxMB <= 0 {
+		maxMB = 10
+	}
 
-	err := r.ParseMultipartForm(int64(ep.MaxSizeMB) << 20)
+	maxBytes := int64(maxMB) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
+	err := r.ParseMultipartForm(maxBytes)
 	if err != nil {
 		logUploadAttempt(watcherUUID, ep.Endpoint, "N/A", "Rejected: File size exceeds limit", time.Now())
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("File size exceeds limit of %d MB", ep.MaxSizeMB)})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("File size exceeds limit of %d MB", maxMB)})
 		return
 	}
 
@@ -715,7 +1008,6 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 
 	addLog(fmt.Sprintf("[%s] Incoming file to %s: %s (%d bytes)", watcherUUID, ep.Endpoint, filename, handler.Size))
 
-	// File extension check
 	ext := strings.ToLower(filepath.Ext(filename))
 	allowed := false
 
@@ -743,7 +1035,6 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 		return
 	}
 
-	// MIME type check
 	buf := make([]byte, 512)
 	n, _ := file.Read(buf)
 	file.Seek(0, io.SeekStart)
@@ -756,7 +1047,6 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 		return
 	}
 
-	// Create directory if not exists
 	if _, err := os.Stat(ep.DestinationFolder); os.IsNotExist(err) {
 		err := os.MkdirAll(ep.DestinationFolder, 0755)
 		if err != nil {
@@ -767,7 +1057,6 @@ func handleUploadCentral(w http.ResponseWriter, r *http.Request, ep Endpoint) {
 		}
 	}
 
-	// Save original filename directly, overwriting existing
 	destPath := filepath.Join(ep.DestinationFolder, filename)
 
 	dst, err := os.Create(destPath)
@@ -945,7 +1234,7 @@ func showAddEndpointDialog(parent fyne.Window, onSave func()) {
 	nameEntry.SetPlaceHolder("e.g. PEBJF Uploads")
 
 	endpointEntry := widget.NewEntry()
-	endpointEntry.SetPlaceHolder("e.g. /upload/pebjf")
+	endpointEntry.SetPlaceHolder("e.g. /upload/pebjf or /sync/photos")
 
 	extEntry := widget.NewEntry()
 	extEntry.SetPlaceHolder("e.g. .pdf,.txt (comma-separated or empty for all)")
@@ -1091,22 +1380,13 @@ func showEditEndpointDialog(parent fyne.Window, ep Endpoint, onSave func()) {
 }
 
 func main() {
-	fmt.Println("=== APLIKASI DIMULAI ===") // ← TAMBAHKAN INI
 	defer handlePanic("Main")
 
-	fmt.Println("=== MEMERIKSA SINGLE INSTANCE ===") // ← TAMBAHKAN INI
-
-	defer handlePanic("Main")
-
-	// Channel untuk sinyal dari instance kedua ke instance pertama.
 	showCh := make(chan struct{}, 1)
 
-	// Cek apakah aplikasi sudah berjalan.
 	if !startSingleInstanceGuard(showCh) {
 		signaled := false
 
-		// Retry beberapa kali untuk mengantisipasi instance pertama baru saja start
-		// dan belum selesai menulis file port IPC.
 		for i := 0; i < 3; i++ {
 			if signalExistingInstance() {
 				signaled = true
@@ -1116,19 +1396,15 @@ func main() {
 		}
 
 		if signaled {
-			fmt.Println("Aplikasi sudah berjalan. Mencoba menampilkan jendela yang sedang aktif...")
+			fmt.Println("DocUploader sudah berjalan. Mencoba menampilkan dashboard yang sedang aktif...")
 		} else {
-			fmt.Println("Aplikasi terdeteksi sedang berjalan, tetapi tidak dapat dihubungi.")
+			fmt.Println("DocUploader terdeteksi sedang berjalan, tetapi tidak dapat dihubungi.")
 		}
 
-		// Beri waktu sebentar agar sinyal diproses oleh instance pertama.
 		time.Sleep(250 * time.Millisecond)
-
-		// Proses kedua langsung keluar.
 		os.Exit(0)
 	}
 
-	// Pastikan cleanup dilakukan saat aplikasi keluar.
 	defer stopSingleInstanceGuard()
 
 	initDB()
@@ -1441,7 +1717,6 @@ func main() {
 	logsTable.SetColumnWidth(3, 110)
 	logsTable.SetColumnWidth(4, 200)
 
-	// --- UPLOAD LOG TOGGLE ---
 	uploadLogToggle := widget.NewCheck("Enable Upload Logging", func(checked bool) {
 		setEnableUploadLog(checked)
 		saveSetting("enable_upload_log", fmt.Sprintf("%t", checked))
@@ -1472,7 +1747,6 @@ func main() {
 
 	scrollSystemLogs := container.NewScroll(logEntry)
 
-	// --- SYSTEM LOG TOGGLE ---
 	systemLogToggle := widget.NewCheck("Enable System Logging", func(checked bool) {
 		setEnableSystemLog(checked)
 		saveSetting("enable_system_log", fmt.Sprintf("%t", checked))
@@ -1538,6 +1812,10 @@ func main() {
 
 				if path == "/watcher/heartbeat" {
 					handleHeartbeat(w, r)
+					return
+				}
+
+				if handleSyncRoutes(w, r, path) {
 					return
 				}
 
@@ -1612,8 +1890,16 @@ func main() {
 			serverLock.Unlock()
 
 			if running {
-				refreshWatchersTable()
-				refreshLogsTable()
+				currentApp := fyne.CurrentApp()
+				if currentApp != nil {
+					driver := currentApp.Driver()
+					if driver != nil {
+						driver.DoFromGoroutine(func() {
+							refreshWatchersTable()
+							refreshLogsTable()
+						}, false)
+					}
+				}
 			}
 		}
 	}()
@@ -1630,8 +1916,6 @@ func main() {
 	finalLayout := container.NewBorder(topLayout, nil, nil, nil, tabs)
 	myWindow.SetContent(finalLayout)
 
-	// Goroutine untuk menerima sinyal dari instance kedua.
-	// Ketika ada sinyal, tampilkan window yang sudah berjalan dan minta fokus.
 	go func() {
 		defer handlePanic("SingleInstanceShow")
 

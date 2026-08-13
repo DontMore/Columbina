@@ -80,10 +80,8 @@ func showAddPathDialog(parent fyne.Window, onSave func()) {
 			return
 		}
 
-		_, err := db.Exec(
-			"INSERT INTO watch_paths (folder_path, api_url, enabled, bearer_token) VALUES (?, ?, 1, ?)",
-			folder, apiUrl, tokenEntry.Text,
-		)
+		_, err := db.Exec("INSERT INTO watch_paths (folder_path, api_url, enabled, bearer_token) VALUES (?, ?, 1, ?)",
+			folder, apiUrl, tokenEntry.Text)
 		if err != nil {
 			dialog.ShowError(err, parent)
 		} else {
@@ -132,10 +130,8 @@ func showEditPathDialog(parent fyne.Window, wp WatchPath, onSave func()) {
 			return
 		}
 
-		_, err := db.Exec(
-			"UPDATE watch_paths SET folder_path = ?, api_url = ?, bearer_token = ? WHERE id = ?",
-			folder, apiUrl, tokenEntry.Text, wp.ID,
-		)
+		_, err := db.Exec("UPDATE watch_paths SET folder_path = ?, api_url = ?, bearer_token = ? WHERE id = ?",
+			folder, apiUrl, tokenEntry.Text, wp.ID)
 		if err != nil {
 			dialog.ShowError(err, parent)
 		} else {

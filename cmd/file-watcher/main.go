@@ -28,8 +28,6 @@ var (
 	singleIPC  net.Listener
 )
 
-// singleInstanceDir menyimpan file lock dan port IPC khusus untuk FileWatcher.
-// Dipisahkan dari DocUploader agar keduanya tidak saling mengunci.
 func singleInstanceDir() string {
 	base, err := os.UserConfigDir()
 	if err != nil {
@@ -42,7 +40,6 @@ func singleInstanceDir() string {
 	return dir
 }
 
-// signalExistingInstance mengirim sinyal ke instance FileWatcher yang sedang berjalan.
 func signalExistingInstance() bool {
 	portBytes, err := os.ReadFile(filepath.Join(singleInstanceDir(), "ipc.port"))
 	if err != nil {
@@ -68,9 +65,6 @@ func signalExistingInstance() bool {
 	return err == nil
 }
 
-// startSingleInstanceGuard mencoba mengunci aplikasi sebagai instance pertama.
-// Jika berhasil, aplikasi membuka listener lokal untuk menerima sinyal "SHOW"
-// dari instance kedua.
 func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	dir := singleInstanceDir()
 	lockPath := filepath.Join(dir, "filewatcher.lock")
@@ -80,19 +74,15 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	locked, err := lock.TryLock()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FileWatcher lock error: %v\n", err)
-
-		// Jika lock error, tetap lanjutkan aplikasi agar tidak mati total.
 		return true
 	}
 
-	// Jika tidak mendapat lock, berarti sudah ada instance lain yang berjalan.
 	if !locked {
 		return false
 	}
 
 	singleLock = lock
 
-	// Instance pertama: buka listener lokal untuk menerima sinyal dari instance kedua.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FileWatcher IPC listen error: %v\n", err)
@@ -134,11 +124,9 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 				buf := make([]byte, 16)
 				_, _ = c.Read(buf)
 
-				// Kirim sinyal ke UI untuk menampilkan window.
 				select {
 				case showCh <- struct{}{}:
 				default:
-					// Jika sudah ada sinyal pending, abaikan sinyal tambahan.
 				}
 			}(conn)
 		}
@@ -147,7 +135,6 @@ func startSingleInstanceGuard(showCh chan<- struct{}) bool {
 	return true
 }
 
-// stopSingleInstanceGuard membersihkan file IPC, menutup listener, dan melepas lock.
 func stopSingleInstanceGuard() {
 	_ = os.Remove(filepath.Join(singleInstanceDir(), "ipc.port"))
 
@@ -163,15 +150,11 @@ func stopSingleInstanceGuard() {
 }
 
 func main() {
-	// Channel untuk sinyal dari instance kedua ke instance pertama.
 	showCh := make(chan struct{}, 1)
 
-	// Cek apakah aplikasi FileWatcher sudah berjalan.
 	if !startSingleInstanceGuard(showCh) {
 		signaled := false
 
-		// Retry beberapa kali untuk mengantisipasi instance pertama baru saja start
-		// dan belum selesai menulis file port IPC.
 		for i := 0; i < 3; i++ {
 			if signalExistingInstance() {
 				signaled = true
@@ -186,27 +169,24 @@ func main() {
 			fmt.Println("FileWatcher terdeteksi sedang berjalan, tetapi tidak dapat dihubungi.")
 		}
 
-		// Beri waktu sebentar agar sinyal diproses oleh instance pertama.
 		time.Sleep(250 * time.Millisecond)
-
-		// Proses kedua langsung keluar.
 		os.Exit(0)
 	}
 
-	// Pastikan cleanup dilakukan saat aplikasi keluar.
 	defer stopSingleInstanceGuard()
 
 	initDB()
+	ensureWatchPathSyncColumns()
 
 	loadWatchPaths()
 	startHeartbeatLoop()
-	startRetryLoop()
+	startUnifiedRetryLoop()
 
 	myApp := app.New()
 	myApp.Settings().SetTheme(ui.ModernTheme{})
 
 	myWindow = myApp.NewWindow("File Watcher Client")
-	myWindow.Resize(fyne.NewSize(720, 520))
+	myWindow.Resize(fyne.NewSize(950, 540))
 
 	pathsTable = widget.NewTable(
 		func() (int, int) {
@@ -225,7 +205,7 @@ func main() {
 				case 0:
 					label.SetText("Folder Path")
 				case 1:
-					label.SetText("API Upload URL")
+					label.SetText("API / Sync Target")
 				case 2:
 					label.SetText("Status")
 				}
@@ -245,7 +225,11 @@ func main() {
 			case 0:
 				label.SetText(wp.FolderPath)
 			case 1:
-				label.SetText(wp.ApiUrl)
+				if wp.Mode == "sync_push" || wp.Mode == "sync_pull" {
+					label.SetText(fmt.Sprintf("%s: %s", wp.Mode, wp.SyncFolder))
+				} else {
+					label.SetText(wp.ApiUrl)
+				}
 			case 2:
 				if wp.Enabled {
 					label.SetText("Enabled")
@@ -256,9 +240,9 @@ func main() {
 		},
 	)
 
-	pathsTable.SetColumnWidth(0, 260)
+	pathsTable.SetColumnWidth(0, 430)
 	pathsTable.SetColumnWidth(1, 280)
-	pathsTable.SetColumnWidth(2, 90)
+	pathsTable.SetColumnWidth(2, 100)
 
 	pathsTable.OnSelected = func(id widget.TableCellID) {
 		if id.Row > 0 {
@@ -266,7 +250,7 @@ func main() {
 		}
 	}
 
-	pathsTable.OnUnselected = func(id widget.TableCellID) {
+	pathsTable.OnUnselected = func(widget.TableCellID) {
 		selectedPathRow = -1
 	}
 
@@ -285,20 +269,13 @@ func main() {
 
 	uuidLabel := widget.NewLabel("Watcher UUID: " + loadSetting("watcher_uuid", "N/A"))
 
-	// Inisialisasi awal lingkaran Vektor Grafis (default merah)
 	serverStatusDot = canvas.NewCircle(color.NRGBA{R: 231, G: 76, B: 60, A: 255})
-
-	// Membungkus lingkaran ke dalam GridWrap container untuk memaksakan ukurannya menjadi 14x14 piksel
 	dotContainer := container.NewGridWrap(fyne.NewSize(14, 14), serverStatusDot)
-
-	// Inisialisasi teks keterangan status
 	serverStatusText = widget.NewLabel("Server Not Connected")
-
-	// Menyatukan lingkaran grafis dan teks keterangan status
 	serverStatusBox := container.NewHBox(container.NewCenter(dotContainer), serverStatusText)
 
 	addBtn := widget.NewButton("Add Folder", func() {
-		showAddPathDialog(myWindow, refreshPathsTable)
+		showAddPathDialogSync(myWindow, refreshPathsTable)
 	})
 
 	editBtn := widget.NewButton("Edit Selected", func() {
@@ -307,7 +284,7 @@ func main() {
 			return
 		}
 
-		showEditPathDialog(myWindow, watchPaths[selectedPathRow], refreshPathsTable)
+		showEditPathDialogSync(myWindow, watchPaths[selectedPathRow], refreshPathsTable)
 	})
 
 	toggleBtn := widget.NewButton("Toggle Status", func() {
@@ -373,7 +350,6 @@ func main() {
 				isWatching = false
 				statusLabel.SetText("🔴 Watcher Stopped")
 
-				// Reset indikator warna menjadi merah saat core dimatikan secara manual
 				serverStatusDot.FillColor = color.NRGBA{R: 231, G: 76, B: 60, A: 255}
 				serverStatusText.SetText("Server Not Connected")
 				serverStatusDot.Refresh()
@@ -388,50 +364,69 @@ func main() {
 				toggleBtn.Enable()
 				deleteBtn.Enable()
 			}
-		} else {
-			serverBase := strings.TrimSpace(serverBaseEntry.Text)
-			watcherName := strings.TrimSpace(watcherNameEntry.Text)
 
-			if serverBase == "" {
-				dialog.ShowInformation("Error", "Server Base URL is required to start watching", myWindow)
-				return
+			return
+		}
+
+		serverBase := strings.TrimSpace(serverBaseEntry.Text)
+		watcherName := strings.TrimSpace(watcherNameEntry.Text)
+
+		if serverBase == "" {
+			dialog.ShowInformation("Error", "Server Base URL is required to start watching", myWindow)
+			return
+		}
+
+		saveSetting("server_base", serverBase)
+		saveSetting("watcher_name", watcherName)
+
+		loadWatchPaths()
+
+		var activePaths []WatchPath
+		for _, wp := range watchPaths {
+			if wp.Enabled {
+				activePaths = append(activePaths, wp)
+			}
+		}
+
+		if len(activePaths) == 0 {
+			dialog.ShowInformation("Error", "At least one enabled folder is required to start monitoring", myWindow)
+			return
+		}
+
+		var err error
+		watcher, err = fsnotify.NewWatcher()
+		if err != nil {
+			dialog.ShowError(err, myWindow)
+			return
+		}
+
+		addWatcherLog("Starting watcher core...")
+
+		for _, wp := range activePaths {
+			mode := wp.Mode
+			if mode == "" {
+				mode = "upload"
 			}
 
-			saveSetting("server_base", serverBase)
-			saveSetting("watcher_name", watcherName)
+			switch mode {
+			case "sync_pull":
+				addWatcherLog(fmt.Sprintf("Sync pull folder: %s", wp.FolderPath))
+				go runSyncPull(wp)
 
-			loadWatchPaths()
+			case "sync_push":
+				addWatchRecursive(watcher, wp.FolderPath)
+				addWatcherLog(fmt.Sprintf("Sync push monitoring: %s", wp.FolderPath))
+				go runSyncPush(wp)
 
-			var activePaths []WatchPath
-			for _, wp := range watchPaths {
-				if wp.Enabled {
-					activePaths = append(activePaths, wp)
-				}
-			}
-
-			if len(activePaths) == 0 {
-				dialog.ShowInformation("Error", "At least one enabled folder is required to start monitoring", myWindow)
-				return
-			}
-
-			var err error
-			watcher, err = fsnotify.NewWatcher()
-			if err != nil {
-				dialog.ShowError(err, myWindow)
-				return
-			}
-
-			addWatcherLog("Starting watcher core...")
-
-			for _, wp := range activePaths {
-				err = watcher.Add(wp.FolderPath)
-				if err != nil {
-					addWatcherLog(fmt.Sprintf("Error adding folder %s: %v", wp.FolderPath, err))
+			default:
+				errAdd := watcher.Add(wp.FolderPath)
+				if errAdd != nil {
+					addWatcherLog(fmt.Sprintf("Error adding folder %s: %v", wp.FolderPath, errAdd))
 				} else {
 					addWatcherLog(fmt.Sprintf("Monitoring: %s", wp.FolderPath))
 
-					files, err := os.ReadDir(wp.FolderPath)
-					if err == nil {
+					files, errRead := os.ReadDir(wp.FolderPath)
+					if errRead == nil {
 						for _, f := range files {
 							if !f.IsDir() {
 								filePath := filepath.Join(wp.FolderPath, f.Name())
@@ -441,61 +436,65 @@ func main() {
 					}
 				}
 			}
-
-			go func() {
-				for {
-					select {
-					case event, ok := <-watcher.Events:
-						if !ok {
-							return
-						}
-
-						if event.Op&fsnotify.Create == fsnotify.Create {
-							info, err := os.Stat(event.Name)
-							if err == nil && !info.IsDir() {
-								filePath := event.Name
-								dirPath := filepath.Dir(filePath)
-
-								var wp WatchPath
-								var found bool
-
-								for _, p := range activePaths {
-									if filepath.Clean(p.FolderPath) == filepath.Clean(dirPath) {
-										wp = p
-										found = true
-										break
-									}
-								}
-
-								if found {
-									addWatcherLog(fmt.Sprintf("File detected: %s", filepath.Base(filePath)))
-									go processFileUpload(filePath, wp.ApiUrl, wp.BearerToken)
-								}
-							}
-						}
-
-					case err, ok := <-watcher.Errors:
-						if !ok {
-							return
-						}
-						addWatcherLog(fmt.Sprintf("Watcher core error: %v", err))
-					}
-				}
-			}()
-
-			isWatching = true
-			statusLabel.SetText("🟢 Monitoring Active...")
-			startStopBtn.SetText("Stop Watching")
-
-			serverBaseEntry.Disable()
-			watcherNameEntry.Disable()
-			addBtn.Disable()
-			editBtn.Disable()
-			toggleBtn.Disable()
-			deleteBtn.Disable()
-
-			go registerWatcher()
 		}
+
+		go func() {
+			for {
+				select {
+				case event, ok := <-watcher.Events:
+					if !ok {
+						return
+					}
+
+					if event.Op&fsnotify.Create == fsnotify.Create {
+						info, err := os.Stat(event.Name)
+						if err != nil {
+							continue
+						}
+
+						wp, found := findWatchPathForPath(activePaths, event.Name)
+						if !found {
+							continue
+						}
+
+						if info.IsDir() {
+							if wp.Mode == "sync_push" {
+								addWatchRecursive(watcher, event.Name)
+								addWatcherLog(fmt.Sprintf("Monitoring new sync subfolder: %s", event.Name))
+							}
+							continue
+						}
+
+						if wp.Mode == "sync_push" {
+							addWatcherLog(fmt.Sprintf("Sync file detected: %s", event.Name))
+							go processSyncPushFile(event.Name, wp)
+						} else {
+							addWatcherLog(fmt.Sprintf("File detected: %s", filepath.Base(event.Name)))
+							go processFileUpload(event.Name, wp.ApiUrl, wp.BearerToken)
+						}
+					}
+
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						return
+					}
+					addWatcherLog(fmt.Sprintf("Watcher core error: %v", err))
+				}
+			}
+		}()
+
+		isWatching = true
+		statusLabel.SetText("🟢 Monitoring Active...")
+		startStopBtn.SetText("Stop Watching")
+
+		serverBaseEntry.Disable()
+		watcherNameEntry.Disable()
+		addBtn.Disable()
+		editBtn.Disable()
+		toggleBtn.Disable()
+		deleteBtn.Disable()
+
+		go registerWatcher()
 	})
 
 	topSettings := container.NewVBox(
@@ -529,8 +528,6 @@ func main() {
 
 	myWindow.SetContent(finalLayout)
 
-	// Goroutine untuk menerima sinyal dari instance kedua.
-	// Ketika ada sinyal, tampilkan window yang sudah berjalan dan minta fokus.
 	go func() {
 		for range showCh {
 			myApp.Driver().DoFromGoroutine(func() {
